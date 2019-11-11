@@ -292,13 +292,13 @@ def xla_computation(fun, static_argnums=(), axis_env=None, backend=None,
     wrapped = lu.wrap_init(fun)
     jax_args, in_tree = tree_flatten((args, kwargs))
     jaxtree_fun, out_tree = flatten_fun(wrapped, in_tree)
-    avals = map(xla.abstractify, jax_args)
-    pvals = [pe.PartialVal((aval, core.unit)) for aval in avals]
+    arg_specs = map(xla.arg_spec, jax_args)
+    pvals = [pe.PartialVal((s.aval, core.unit)) for s in arg_specs]
     jaxpr, _, consts = pe.trace_to_jaxpr(jaxtree_fun, pvals)
     axis_env_ = make_axis_env(xla.jaxpr_replicas(jaxpr))
     c = xb.make_computation_builder('xla_computation_{}'.format(fun_name))
     xla_consts = map(c.Constant, consts)
-    xla_args = xla._xla_callable_args(c, avals, tuple_args)
+    xla_args = xla._xla_callable_args(c, arg_specs, tuple_args)
     outs = xla.jaxpr_subcomp(c, jaxpr, backend, axis_env_, xla_consts, (),
                              *xla_args)
     return c.Build(c.Tuple(*outs))

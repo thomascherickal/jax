@@ -74,8 +74,8 @@ import functools
 from absl import app
 from absl import flags
 import jax.api
-import jax.numpy as np
 from jax.lib import xla_client
+import numpy as onp
 
 FLAGS = flags.FLAGS
 
@@ -122,7 +122,7 @@ def jax_to_hlo(fn, input_shapes, constants=None):
       raise ValueError('Shape %s has a non-default layout, but only '
                        'the default layout is allowed.' % str(shape))
 
-    args.append(np.zeros(shape.dimensions(), dtype=shape.numpy_dtype()))
+    args.append(onp.zeros(shape.dimensions(), dtype=shape.numpy_dtype()))
 
   # Curry `constants` into the function.
   fn_curried = functools.partial(fn, **constants)
@@ -156,14 +156,14 @@ def main(argv):
   constants = {}
   for k, v in literal_eval(FLAGS.constants).items():
     if isinstance(v, list):
-      v = np.asarray(v)
+      v = onp.asarray(v)
     constants[k] = v
 
   for k, v in literal_eval(FLAGS.evaled_constants).items():
     if isinstance(v, str):
       v = literal_eval(v)
     if isinstance(v, list):
-      v = np.asarray(v)
+      v = onp.asarray(v)
     if k in constants:
       raise ValueError(
           'Argument appears in both --constants and --evaled_constants: %s' % k)

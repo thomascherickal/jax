@@ -17,6 +17,7 @@ from __future__ import division
 from __future__ import print_function
 
 import collections
+import contextlib
 from functools import partial
 import unittest
 import warnings
@@ -36,7 +37,7 @@ from jax import jit, grad, device_put, jacfwd, jacrev, hessian
 from jax import api, lax
 from jax.core import Primitive
 from jax.interpreters import ad
-from jax.interpreters.xla import DeviceArray
+from jax.interpreters import xla
 from jax.abstract_arrays import concretization_err_msg
 from jax.lib import xla_bridge as xb
 from jax import test_util as jtu
@@ -278,7 +279,7 @@ class APITest(jtu.JaxTestCase):
   def test_device_put_and_get(self):
     x = onp.arange(12.).reshape((3, 4)).astype("float32")
     dx = api.device_put(x)
-    self.assertIsInstance(dx, DeviceArray)
+    self.assertIsInstance(dx, xla.DeviceArray)
     x2 = api.device_get(dx)
     self.assertIsInstance(x2, onp.ndarray)
     assert onp.all(x == x2)
@@ -802,11 +803,11 @@ class APITest(jtu.JaxTestCase):
 
   def test_devicearray_repr(self):
     x = device_put(np.zeros(3))
-    self.assertIsInstance(x, DeviceArray)
+    self.assertIsInstance(x, xla.DeviceArray)
     repr(x)  # doesn't crash
 
     x = device_put(np.ones(3) + 1j * np.ones(3))
-    self.assertIsInstance(x, DeviceArray)
+    self.assertIsInstance(x, xla.DeviceArray)
     repr(x)  # doesn't crash
 
   def test_devicearray_delete(self):
@@ -1019,7 +1020,7 @@ class APITest(jtu.JaxTestCase):
   def test_jit_device(self):
     device = xb.devices()[-1]
     x = api.jit(lambda x: x, device=device)(3.)
-    self.assertIsInstance(x, DeviceArray)
+    self.assertIsInstance(x, xla.DeviceArray)
     self.assertEqual(x.device_buffer.device(), device)
 
   def test_jit_of_noncallable(self):
@@ -1287,7 +1288,7 @@ class APITest(jtu.JaxTestCase):
     python_should_be_executing = False
     api.pmap(f, 'i')(x)
 
-  def test_repr(self):
+  def test_device_array_repr(self):
     rep = repr(np.ones(()) + 1.)
     self.assertStartsWith(rep, 'DeviceArray')
 
@@ -1301,49 +1302,6 @@ class APITest(jtu.JaxTestCase):
         "positional arguments to be passed by the caller, but got only 0 "
         "positional arguments.",
         lambda: partial(df, x=0.)(y=1.))
-
-
-class JaxprTest(jtu.JaxTestCase):
-
-  def test_scalar_literals(self):
-    jaxpr = api.make_jaxpr(lambda x: x + 2)(42)
-    self.assertLen(jaxpr.jaxpr.constvars, 0)
-
-  def test_const(self):
-    def fun(x):
-      return (x, 1., np.zeros(1))
-
-    jaxpr = api.make_jaxpr(fun)(0.)
-    self.assertMultiLineStrippedEqual(str(jaxpr), """
-    { lambda b ;  ; a.
-        let
-        in [a, 1.0, b] }
-    """)
-
-  def test_cond(self):
-    def f(x):
-      return lax.cond(x >= 0.,
-                      x + 1.,
-                      lambda xt: xt + x,
-                      x + 2.,
-                      lambda xf: xf - x)
-    jaxpr = api.make_jaxpr(f)(3.)
-    self.assertMultiLineStrippedEqual(str(jaxpr), """
-    { lambda  ;  ; a.
-      let b = ge a 0.0
-          c = add a 1.0
-          d = add a 2.0
-          e = cond[ false_jaxpr={ lambda  ;  ; b a.
-                                  let c = sub a b
-                                  in [c] }
-                    false_nconsts=1
-                    true_jaxpr={ lambda  ;  ; b a.
-                                 let c = add a b
-                                 in [c] }
-                    true_nconsts=1 ] b a c a d
-      in [e] }
-        """)
-
 
   def test_grad_of_jit_compilation_caching(self):
     if not hasattr(self, "assertLogs"):
@@ -1552,6 +1510,89 @@ class JaxprTest(jtu.JaxTestCase):
     x = 4.
     self.assertAllClose(f1(x), f2(x), check_dtypes=False)
     self.assertAllClose(api.grad(f1)(x), api.grad(f2)(x), check_dtypes=False)
+
+
+class JaxprTest(jtu.JaxTestCase):
+
+  def test_scalar_literals(self):
+    jaxpr = api.make_jaxpr(lambda x: x + 2)(42)
+    self.assertLen(jaxpr.jaxpr.constvars, 0)
+
+  def test_const(self):
+    def fun(x):
+      return (x, 1., np.zeros(1))
+
+    jaxpr = api.make_jaxpr(fun)(0.)
+    self.assertMultiLineStrippedEqual(str(jaxpr), """
+    { lambda b ;  ; a.
+        let
+        in [a, 1.0, b] }
+    """)
+
+  def test_cond(self):
+    def f(x):
+      return lax.cond(x >= 0.,
+                      x + 1.,
+                      lambda xt: xt + x,
+                      x + 2.,
+                      lambda xf: xf - x)
+    jaxpr = api.make_jaxpr(f)(3.)
+    self.assertMultiLineStrippedEqual(str(jaxpr), """
+    { lambda  ;  ; a.
+      let b = ge a 0.0
+          c = add a 1.0
+          d = add a 2.0
+          e = cond[ false_jaxpr={ lambda  ;  ; b a.
+                                  let c = sub a b
+                                  in [c] }
+                    false_nconsts=1
+                    true_jaxpr={ lambda  ;  ; b a.
+                                 let c = add a b
+                                 in [c] }
+                    true_nconsts=1 ] b a c a d
+      in [e] }
+        """)
+
+
+class LazyTest(jtu.JaxTestCase):
+
+  @contextlib.contextmanager
+  def _check_num_eager_computations(self, num):
+    xla_primitive_callable = xla.xla_primitive_callable
+    count = [0]
+
+    def primitive_callable_and_count(*args, **kwargs):
+      count[0] += 1
+      return xla_primitive_callable(*args, **kwargs)
+
+    try:
+      xla.xla_primitive_callable = primitive_callable_and_count
+      yield
+    finally:
+      xla.xla_primitive_callable = xla_primitive_callable
+
+    self.assertEqual(count[0], num)
+
+  def test_lazy_reshape_multiply(self):
+    a = np.array([1, 2, 3], dtype=onp.int32)
+    with self._check_num_eager_computations(1):
+      x = a[:, None] * a[None, :]
+    expected = onp.outer([1, 2, 3], [1, 2, 3])
+    self.assertAllClose(x, expected, check_dtypes=False)
+
+  def test_lazy_iota_broadcast_add(self):
+    with self._check_num_eager_computations(1):
+      a = np.arange(3, dtype=onp.int32)
+      y = np.broadcast_to(a, (5, 3))
+      z = y + 5
+    expected = onp.broadcast_to(onp.arange(3), (5, 3)) + 5
+    self.assertAllClose(z, expected, check_dtypes=False)
+
+  def test_lazy_eye(self):
+    with self._check_num_eager_computations(1):
+      z = lax.eye(onp.float32, (3, 3), 0) + 5.
+    expected = onp.eye(3, dtype=onp.float32) + 5
+    self.assertAllClose(z, expected, check_dtypes=True)
 
 
 if __name__ == '__main__':

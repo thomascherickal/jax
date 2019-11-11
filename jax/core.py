@@ -116,14 +116,18 @@ class Literal(object):
       if type(val) in literalable_types:
         try:
           self.hash = hash((val.item(), val.dtype))
-        except (TypeError, AttributeError):
+        except (TypeError, AttributeError, ValueError):
           self.hash = None
 
   def __hash__(self):
     return id(self.val) if self.hash is None else self.hash
 
   def __eq__(self, other):
-    return self.val is other.val if self.hash is None else self.val == other.val
+    if self.hash is None:
+      return self.val is other.val
+    else:
+      return (self.val == other.val or
+              self.val != self.val and other.val != other.val)  # nans are equal
 
   def __repr__(self):
     if self.hash is None:
